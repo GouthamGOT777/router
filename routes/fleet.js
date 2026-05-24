@@ -179,6 +179,7 @@ router.post('/:id/discover', async (req, res) => {
       firmware:  discovered.firmware || r.firmware,
       uptime:    discovered.uptime   || r.uptime,
       serial:    discovered.serial   || r.serial,
+      osType:    discovered.osType   || r.osType,
       ports:     discovered.interfaceCount  || r.ports,
       upPorts:   discovered.upInterfaceCount || 0,
       state:     'ok',

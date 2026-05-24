@@ -302,6 +302,13 @@ class SSHManager {
     };
   }
 
+  // ── getRouterInfo — returns full cached router object including osType ───────
+
+  getRouterInfo(routerId) {
+    const conn = this._pool.get(routerId);
+    return conn ? conn.router : null;
+  }
+
   // ── getAllStatuses ───────────────────────────────────────────────────────────
 
   getAllStatuses() {
@@ -335,23 +342,39 @@ function _parseVersion(text) {
   let m = text.match(/IOS.*?Software.*?Version\s+([\d\w\.\(\)]+)/i);
   if (m) { result.firmware = `IOS ${m[1]}`; result.osType = 'ios'; }
 
-  // JunOS
-  m = text.match(/JUNOS\s+([^\s,\[]+)/i);
+  // JunOS — "Junos: 21.2R3-S3.5" or "JUNOS 21.2R3"
+  m = text.match(/Junos:\s*([^\s\[,]+)/i) || text.match(/JUNOS\s+([^\s,\[]+)/i);
   if (m) { result.firmware = `JunOS ${m[1]}`; result.osType = 'junos'; }
 
-  // HelixOS (fictional, matches our demo banner)
+  // JunOS Model line: "Model: qfx5120-32c"
+  m = text.match(/^Model:\s*(.+)/im);
+  if (m) result.model = m[1].trim();
+
+  // JunOS Hostname
+  m = text.match(/^Hostname:\s*(.+)/im);
+  if (m) result.hostname = m[1].trim();
+
+  // HelixOS
   m = text.match(/HelixOS\s+([\d\.]+)/i);
   if (m) { result.firmware = `HelixOS ${m[1]}`; result.osType = 'helixos'; }
 
-  // Generic: Model
-  m = text.match(/(?:Cisco|Juniper|Helix)\s+([\w-]+(?:\s+[\w-]+)?)\s+(?:router|switch|chassis|processor)/i);
-  if (m) result.model = m[1].trim();
+  // Cisco Generic Model
+  if (!result.model) {
+    m = text.match(/(?:Cisco|Juniper|Helix)\s+([\w-]+(?:\s+[\w-]+)?)\s+(?:router|switch|chassis|processor)/i);
+    if (m) result.model = m[1].trim();
+  }
 
-  // Uptime
+  // Uptime — Cisco style
   m = text.match(/uptime is (.+)/i);
   if (m) result.uptime = m[1].trim();
 
-  // Serial / processor board
+  // JunOS uptime: "System booted: 2024-01-01 00:00:00 UTC (31w6d 04:52 ago)"
+  if (!result.uptime) {
+    m = text.match(/\((.+ago)\)/i);
+    if (m) result.uptime = m[1].trim();
+  }
+
+  // Serial
   m = text.match(/(?:Processor board ID|S\/N:|Serial Number:?)\s*([\w-]+)/i);
   if (m) result.serial = m[1].trim();
 
@@ -360,6 +383,19 @@ function _parseVersion(text) {
 
 function _countInterfaces(text) {
   if (!text) return { total: 0, up: 0 };
+
+  // Juniper terse format: "et-0/0/0   up   up"
+  if (/^\S+\s+(up|down)\s+(up|down)/m.test(text)) {
+    const skipRe = /^(lsi|pip|vtep|esi|gr-|ip-|mt-|pd-|pe-|pfe-|pfh-|dsc|gre|ipip|tap|lo|irb|esi|bme|jsrv|pime|pimd|rbeb|rcb|vme)/i;
+    const lines = text.split('\n').filter((l) => {
+      const m = l.match(/^(\S+)\s+(up|down)\s+(up|down)/);
+      return m && !m[1].includes('.') && !skipRe.test(m[1]);
+    });
+    const up = lines.filter((l) => l.match(/^\S+\s+up\s+up/)).length;
+    return { total: lines.length, up };
+  }
+
+  // Cisco brief format
   const lines = text.split('\n').filter((l) => /^\s*(Gi|Te|Fa|Et|xe-|ge-|fe-)/i.test(l));
   const up    = lines.filter((l) => /\bup\b/i.test(l)).length;
   return { total: lines.length, up };

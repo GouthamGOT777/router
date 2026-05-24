@@ -113,26 +113,48 @@ async function _collectAll(router) {
   const run = (cmd, timeout = 15000) =>
     sshManager.exec(router.id, cmd, { timeout }).then((r) => r.stdout).catch(() => '');
 
-  const [versionOut, ifacesOut, cpuOut, memOut, ospfOut, bgpOut, routeOut, logsOut] =
-    await Promise.all([
-      run('show version'),
-      run('show interfaces'),
-      run('show processes cpu sorted | head 5'),
-      run('show processes memory sorted | head 5'),
-      run('show ip ospf neighbor'),
-      run('show ip bgp summary'),
-      run('show ip route summary'),
-      run('show logging | tail 30'),
-    ]);
+  // Detect OS from live connection (set during discover) or stored fleet data
+  const connInfo = sshManager.getRouterInfo(router.id);
+  const osType   = connInfo?.osType || router.osType || 'ios';
+  const isJunos  = osType === 'junos';
+
+  let versionOut, ifacesOut, cpuOut, memOut, ospfOut, bgpOut, routeOut, logsOut;
+
+  if (isJunos) {
+    [versionOut, ifacesOut, cpuOut, ospfOut, bgpOut, routeOut, logsOut] =
+      await Promise.all([
+        run('show version'),
+        run('show interfaces terse'),
+        run('show chassis routing-engine'),
+        run('show ospf neighbor'),
+        run('show bgp summary'),
+        run('show route summary'),
+        run('show log messages | last 30'),
+      ]);
+    memOut = cpuOut; // routing-engine output has both CPU and memory
+  } else {
+    [versionOut, ifacesOut, cpuOut, memOut, ospfOut, bgpOut, routeOut, logsOut] =
+      await Promise.all([
+        run('show version'),
+        run('show interfaces'),
+        run('show processes cpu sorted | head 5'),
+        run('show processes memory sorted | head 5'),
+        run('show ip ospf neighbor'),
+        run('show ip bgp summary'),
+        run('show ip route summary'),
+        run('show logging | tail 30'),
+      ]);
+  }
 
   return {
-    collectedAt:  new Date().toISOString(),
-    system:       parseSystem(versionOut, cpuOut, memOut),
-    interfaces:   parseInterfaces(ifacesOut),
-    ospf:         parseOspfNeighbors(ospfOut),
-    bgp:          parseBgpSummary(bgpOut),
-    routing:      parseRouteSummary(routeOut),
-    logs:         parseLogs(logsOut),
+    collectedAt: new Date().toISOString(),
+    osType,
+    system:      isJunos ? parseSystemJunos(versionOut, cpuOut)  : parseSystem(versionOut, cpuOut, memOut),
+    interfaces:  isJunos ? parseInterfacesTerse(ifacesOut)       : parseInterfaces(ifacesOut),
+    ospf:        isJunos ? parseOspfNeighborsJunos(ospfOut)      : parseOspfNeighbors(ospfOut),
+    bgp:         isJunos ? parseBgpSummaryJunos(bgpOut)          : parseBgpSummary(bgpOut),
+    routing:     isJunos ? parseRouteSummaryJunos(routeOut)      : parseRouteSummary(routeOut),
+    logs:        parseLogs(logsOut),
   };
 }
 
@@ -336,6 +358,146 @@ function parseLogs(text) {
   return events.slice(-20);
 }
 
+// ── JunOS Parsers ─────────────────────────────────────────────────────────────
+
+function parseSystemJunos(versionText, reText) {
+  const sys = {};
+
+  // Version: "Junos: 21.2R3-S3.5"
+  let m = versionText.match(/Junos:\s*([^\s\[,]+)/i);
+  if (m) sys.firmware = `JunOS ${m[1]}`;
+
+  // Model: "Model: qfx5120-32c"
+  m = versionText.match(/^Model:\s*(.+)/im);
+  if (m) sys.model = m[1].trim();
+
+  // Uptime from "System booted: ... (31w6d 04:52 ago)"
+  m = versionText.match(/\((.+?ago)\)/);
+  if (m) sys.uptime = m[1];
+
+  // CPU from chassis routing-engine: "Idle  99 percent"
+  m = reText.match(/Idle\s+(\d+)\s+percent/i);
+  if (m) {
+    const idle = parseInt(m[1], 10);
+    sys.cpu5s = 100 - idle;
+    sys.cpu1m = 100 - idle;
+    sys.cpu5m = 100 - idle;
+  }
+
+  // Memory utilization: "Memory utilization  24 percent"
+  m = reText.match(/Memory utilization\s+(\d+)\s+percent/i);
+  if (m) sys.memFreePct = 100 - parseInt(m[1], 10);
+
+  // DRAM: "DRAM  3965 MB (3969 MB installed)"
+  m = reText.match(/DRAM\s+(\d+)\s+MB\s+\((\d+)\s+MB\s+installed\)/i);
+  if (m) {
+    sys.memUsed  = parseInt(m[2], 10) - parseInt(m[1], 10);
+    sys.memTotal = parseInt(m[2], 10);
+  }
+
+  return sys;
+}
+
+const _JUNOS_IFACE_SKIP = /^(lsi|pip|vtep|esi|gr-|ip-|mt-|pd-|pe-|pfe-|pfh-|dsc|gre|ipip|tap|irb|bme|jsrv|pime|pimd|rbeb|rcb|vme)/i;
+
+function parseInterfacesTerse(text) {
+  if (!text) return [];
+  const lines  = text.split('\n');
+  // Build a map of physical → logical IPs
+  const ipMap  = {};
+  for (const line of lines) {
+    const m = line.match(/^(\S+)\.(\d+)\s+(up|down)\s+(up|down)\s+inet\s+([\d.\/]+)/);
+    if (m) ipMap[m[1]] = ipMap[m[1]] || m[5];
+  }
+
+  const ifaces = [];
+  for (const line of lines) {
+    // Physical interface lines: no dot in name, two state columns
+    const m = line.match(/^(\S+)\s+(up|down)\s+(up|down)\s*(.*)$/);
+    if (!m) continue;
+    const name = m[1];
+    if (name.includes('.')) continue;               // logical unit — skip
+    if (_JUNOS_IFACE_SKIP.test(name)) continue;    // internal interfaces
+
+    const adminState   = m[2];
+    const lineProtocol = m[3];
+    ifaces.push({
+      name,
+      adminState,
+      lineProtocol,
+      state: lineProtocol === 'up' ? 'ok' : adminState === 'down' ? 'warn' : 'err',
+      ip:    ipMap[name] || undefined,
+      // Media type hints from name prefix
+      media: name.startsWith('et-') ? 'SFP+' : name.startsWith('xe-') ? 'SFP+' : name.startsWith('ge-') ? '1GE-T' : name.startsWith('re0') ? 'mgmt' : '',
+    });
+  }
+  return ifaces;
+}
+
+function parseOspfNeighborsJunos(text) {
+  if (!text) return [];
+  const neighbors = [];
+  // "Address  Interface  State  ID  Pri  Dead"
+  // "10.0.0.22  et-0/0/0.0  Full  10.0.0.21  1  32"
+  const re = /^([\d.]+)\s+(\S+)\s+(\S+)\s+([\d.]+)\s+(\d+)\s+(\d+)/gm;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    neighbors.push({
+      address:    m[1],
+      interface:  m[2],
+      state:      m[3],
+      neighborId: m[4],
+      priority:   parseInt(m[5], 10),
+      deadTime:   m[6],
+      ok:         m[3].toLowerCase().startsWith('full'),
+    });
+  }
+  return neighbors;
+}
+
+function parseBgpSummaryJunos(text) {
+  if (!text) return { peers: [] };
+  const result = { peers: [] };
+
+  // "Peer  AS  InPkt  OutPkt  OutQ  Flaps  Last Up/Dwn  State|#Active/..."
+  const re = /^([\d.]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+\d+\s+\d+\s+([\w\s:d]+?)\s+([\d]+\/[\d]+\/[\d]+\/[\d]+|\w+)/gm;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const stateOrPfx = m[6];
+    const pfxParts   = stateOrPfx.split('/');
+    const active     = pfxParts.length >= 2 ? parseInt(pfxParts[0], 10) : NaN;
+    result.peers.push({
+      neighbor:    m[1],
+      remoteAs:    parseInt(m[2], 10),
+      msgRcvd:     parseInt(m[3], 10),
+      msgSent:     parseInt(m[4], 10),
+      upDown:      m[5].trim(),
+      stateOrPfx,
+      prefixes:    isNaN(active) ? 0 : active,
+      established: !isNaN(active),
+    });
+  }
+  return result;
+}
+
+function parseRouteSummaryJunos(text) {
+  if (!text) return {};
+  const summary = {};
+  let total = 0;
+  // "inet.0: 14802 destinations, 14802 routes (14795 active ..."
+  const totM = text.match(/inet\.0:\s*(\d+)\s+destinations/i);
+  if (totM) total = parseInt(totM[1], 10);
+
+  // Per-protocol lines: "  Direct:    5 routes,   5 active"
+  const re = /^\s*([\w-]+):\s+(\d+)\s+routes/gm;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    summary[m[1]] = parseInt(m[2], 10);
+  }
+  summary.total = total;
+  return summary;
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 function _send(ws, obj) {
@@ -360,11 +522,17 @@ module.exports = {
   unsubscribe,
   pollNow,
   getSnapshot,
-  // Export parsers for testing
+  // Cisco/IOS parsers
   parseSystem,
   parseInterfaces,
   parseOspfNeighbors,
   parseBgpSummary,
   parseRouteSummary,
   parseLogs,
+  // JunOS parsers
+  parseSystemJunos,
+  parseInterfacesTerse,
+  parseOspfNeighborsJunos,
+  parseBgpSummaryJunos,
+  parseRouteSummaryJunos,
 };
